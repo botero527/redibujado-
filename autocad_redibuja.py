@@ -395,67 +395,204 @@ def crear_lwpoly(mspace, segs, cerrada, capa, color):
         err(f"crear LWPOLYLINE: {e}"); return None
 
 # ═══════════════════════════════════════════════════
-# PROCESAR UNA ENTIDAD
+# UNIR FRAGMENTOS EN CADENAS CONTINUAS
 # ═══════════════════════════════════════════════════
 
-def procesar(ent, mspace, doc):
-    tipo=ent.EntityName; capa=getattr(ent.dxf if hasattr(ent,'dxf') else ent,'Layer','0')
-    try: capa=ent.Layer
-    except: capa='0'
+TOL_UNION = 1.0   # mm — distancia maxima entre extremos para considerar conexion
 
-    # No procesar entidades ya en _ORIGINAL
-    if cfg.ORIG_LAYER.upper() in capa.upper():
-        skip(f"[{tipo}] {capa} — ya es _ORIGINAL, saltando"); return None
+def unir_cadenas(lista_pts_cerrada):
+    """
+    Recibe lista de (pts, cerrada).
+    Une los fragmentos que se conectan extremo a extremo.
+    Retorna lista de (pts_unidos, cerrada).
+    """
+    frags  = [list(p) for p, _ in lista_pts_cerrada]
+    cerr   = [c for _, c in lista_pts_cerrada]
+    n      = len(frags)
+    usados = [False] * n
+    cadenas = []
 
-    # No re-procesar LWPOLYLINEs que ya son resultado _ARC (solo si NO son splines)
-    sufijo_up = cfg.SUFIJO.upper()
-    if capa.upper().endswith(sufijo_up) and 'LWPOLYLINE' in tipo.upper():
-        skip(f"[{tipo}] {capa} — ya es LWPOLYLINE _ARC procesada, saltando"); return None
+    for i0 in range(n):
+        if usados[i0]: continue
+        if cerr[i0]:
+            # Fragmento ya cerrado — no unir
+            cadenas.append((frags[i0], True))
+            usados[i0] = True
+            continue
 
-    pts, cerrada = leer_entidad(ent)
-    n_orig=len(pts)
-    if n_orig<2:
-        skip(f"[{tipo}] {capa} — sin puntos"); return None
+        cadena = list(frags[i0])
+        usados[i0] = True
 
-    largo=sum(dist2d(pts[i],pts[i+1]) for i in range(len(pts)-1))
-    if largo<0.5:
-        skip(f"[{tipo}] {capa} — muy corto ({largo:.2f}mm)"); return None
+        # Extender por el FINAL de la cadena
+        avance = True
+        while avance:
+            avance = False
+            p_fin = cadena[-1]
+            for j in range(n):
+                if usados[j] or cerr[j]: continue
+                if dist2d(frags[j][0], p_fin) < TOL_UNION:
+                    cadena.extend(frags[j][1:])
+                    usados[j] = True; avance = True; break
+                elif dist2d(frags[j][-1], p_fin) < TOL_UNION:
+                    cadena.extend(list(reversed(frags[j]))[1:])
+                    usados[j] = True; avance = True; break
 
-    # Paso 1: DP
-    red=reducir_pts(pts, cfg.TOL_DP, cerrada)
-    if not red or len(red)<2:
-        err(f"[{tipo}] {capa} — DP sin resultado"); return None
-    n_dp=len(red)
+        # Extender por el INICIO de la cadena
+        avance = True
+        while avance:
+            avance = False
+            p_ini = cadena[0]
+            for j in range(n):
+                if usados[j] or cerr[j]: continue
+                if dist2d(frags[j][-1], p_ini) < TOL_UNION:
+                    cadena = frags[j][:-1] + cadena
+                    usados[j] = True; avance = True; break
+                elif dist2d(frags[j][0], p_ini) < TOL_UNION:
+                    cadena = list(reversed(frags[j]))[:-1] + cadena
+                    usados[j] = True; avance = True; break
 
-    # Quitar duplicado final para arc_fit
-    arc_pts=red
+        # Detectar si la cadena es cerrada
+        es_cerrada = dist2d(cadena[0], cadena[-1]) < TOL_UNION * 2
+        if es_cerrada and dist2d(cadena[0], cadena[-1]) > 1e-6:
+            cadena.append(cadena[0])
+
+        cadenas.append((cadena, es_cerrada))
+
+    return cadenas
+
+def pipeline_pts(pts, cerrada, capa, mspace, doc, n_orig_display=None):
+    """
+    Aplica DP + arc-fit a una secuencia de puntos y crea la LWPOLYLINE.
+    Retorna (n_orig, n_dp, n_segs, n_lin, n_arc) o None si falla.
+    """
+    n_orig = n_orig_display or len(pts)
+
+    largo = sum(dist2d(pts[i], pts[i+1]) for i in range(len(pts)-1))
+    if largo < 0.5:
+        skip(f"cadena muy corta ({largo:.2f}mm)"); return None
+
+    red = reducir_pts(pts, cfg.TOL_DP, cerrada)
+    if not red or len(red) < 2:
+        err("DP sin resultado"); return None
+    n_dp = len(red)
+
+    arc_pts = red
     if cerrada and len(red)>2 and dist2d(red[0],red[-1])<cfg.TOL_ARCO:
-        arc_pts=red[:-1]
+        arc_pts = red[:-1]
 
-    # Paso 2: Arc-fit
-    segs=arc_fit(arc_pts)
+    segs = arc_fit(arc_pts)
     if not segs:
-        err(f"[{tipo}] {capa} — arc_fit sin resultado"); return None
+        err("arc_fit sin resultado"); return None
 
-    n_lin=sum(1 for s in segs if s[2]==0.0)
-    n_arc=sum(1 for s in segs if s[2]!=0.0)
+    n_lin = sum(1 for s in segs if s[2]==0.0)
+    n_arc = sum(1 for s in segs if s[2]!=0.0)
 
-    # Crear capa destino — no doblar el sufijo si ya lo tiene
+    # Capa destino
     sufijo_up = cfg.SUFIJO.upper()
-    if capa.upper().endswith(sufijo_up):
-        capa_dst = capa          # ya tiene _ARC, redibujar en la misma capa
-    else:
-        capa_dst = capa + cfg.SUFIJO
+    capa_dst = capa if capa.upper().endswith(sufijo_up) else capa + cfg.SUFIJO
     try: doc.Layers.Add(capa_dst)
     except: pass
 
-    nueva=crear_lwpoly(mspace, segs, cerrada, capa_dst, cfg.COLOR)
+    nueva = crear_lwpoly(mspace, segs, cerrada, capa_dst, cfg.COLOR)
     if nueva is None: return None
-    # Original queda intacta en su capa — la nueva queda encima
 
-    r1=(1-n_dp/n_orig)*100 if n_orig else 0
-    ok(f"[{tipo:20}] {capa:22} | {n_orig}→{n_dp}pts({r1:.0f}%) → {len(segs)}segs ({n_lin}L+{n_arc}A)")
     return (n_orig, n_dp, len(segs), n_lin, n_arc)
+
+# ═══════════════════════════════════════════════════
+# PROCESAR UNA ENTIDAD
+# ═══════════════════════════════════════════════════
+
+def _capa_valida(ent):
+    """Retorna (capa, tipo) o None si la entidad debe saltarse."""
+    try:    tipo = ent.EntityName
+    except: return None
+    try:    capa = ent.Layer
+    except: capa = '0'
+    if cfg.ORIG_LAYER.upper() in capa.upper():
+        return None
+    sufijo_up = cfg.SUFIJO.upper()
+    if capa.upper().endswith(sufijo_up) and 'LWPOLYLINE' in tipo.upper():
+        return None
+    return capa, tipo
+
+def procesar_grupo(ents, mspace, doc):
+    """
+    Procesa un grupo de entidades de la MISMA capa.
+    Si hay varios fragmentos conectados, los une antes de redibujar.
+    Retorna lista de (n_orig, n_dp, n_segs, n_lin, n_arc) por cadena creada.
+    """
+    cv = _capa_valida(ents[0])
+    if cv is None: return []
+    capa = cv[0]
+
+    # Extraer puntos de cada entidad
+    lista_pc = []   # [(pts, cerrada), ...]
+    n_tot_orig = 0
+    for ent in ents:
+        pts, cerrada = leer_entidad(ent)
+        if len(pts) < 2: continue
+        largo = sum(dist2d(pts[i], pts[i+1]) for i in range(len(pts)-1))
+        if largo < 0.3: continue
+        lista_pc.append((pts, cerrada))
+        n_tot_orig += len(pts)
+
+    if not lista_pc:
+        return []
+
+    if len(lista_pc) == 1:
+        # Una sola entidad — pipeline directo
+        pts, cerrada = lista_pc[0]
+        res = pipeline_pts(pts, cerrada, capa, mspace, doc, n_tot_orig)
+        if res:
+            ok(f"[1 ent ] {capa:25} | {res[0]}→{res[1]}pts → {res[2]}segs ({res[3]}L+{res[4]}A)")
+        return [res] if res else []
+
+    # Varios fragmentos — intentar unir
+    cadenas = unir_cadenas(lista_pc)
+    n_unidas = sum(1 for c,_ in cadenas if True)
+    n_frags  = len(lista_pc)
+
+    if n_unidas < n_frags:
+        info(f"  {capa}: {n_frags} fragmentos → {n_unidas} cadenas unidas")
+    else:
+        info(f"  {capa}: {n_frags} entidades (sin conexion directa)")
+
+    resultados = []
+    for idx, (pts_c, cerrada_c) in enumerate(cadenas):
+        res = pipeline_pts(pts_c, cerrada_c, capa, mspace, doc)
+        if res:
+            etiq = f"cadena {idx+1}/{n_unidas}" if n_unidas > 1 else "unida"
+            ok(f"[{etiq:12}] {capa:22} | {res[0]}→{res[1]}pts → {res[2]}segs ({res[3]}L+{res[4]}A)")
+            resultados.append(res)
+        else:
+            n_fail_c = len(pts_c)
+            skip(f"cadena {idx+1} de {capa} — sin resultado ({n_fail_c} pts)")
+
+    return resultados
+
+def procesar(ent, mspace, doc):
+    """Procesa una sola entidad (wrapper para compatibilidad)."""
+    cv = _capa_valida(ent)
+    if cv is None:
+        skip(f"[{ent.EntityName}] {getattr(ent,'Layer','?')} — saltando"); return None
+    capa, tipo = cv
+
+    pts, cerrada = leer_entidad(ent)
+    n_orig = len(pts)
+    if n_orig < 2:
+        skip(f"[{tipo}] {capa} — sin puntos"); return None
+
+    largo = sum(dist2d(pts[i], pts[i+1]) for i in range(len(pts)-1))
+    if largo < 0.5:
+        skip(f"[{tipo}] {capa} — muy corto ({largo:.2f}mm)"); return None
+
+    res = pipeline_pts(pts, cerrada, capa, mspace, doc, n_orig)
+    if res is None: return None
+
+    no, nd, ns, nl, na = res
+    r1 = (1 - nd/no)*100 if no else 0
+    ok(f"[{tipo:20}] {capa:22} | {no}→{nd}pts({r1:.0f}%) → {ns}segs ({nl}L+{na}A)")
+    return res
 
 # ═══════════════════════════════════════════════════
 # MAIN — MENU INTERACTIVO
@@ -546,19 +683,41 @@ def main():
             n_ok=n_fail=0
             tot_o=tot_dp=tot_s=tot_l=tot_a=0
 
+            # Agrupar por capa para unir fragmentos del mismo contorno
+            from collections import defaultdict
+            por_capa = defaultdict(list)
             for ent in entidades:
+                try:    capa_e = ent.Layer
+                except: capa_e = '0'
+                por_capa[capa_e].append(ent)
+
+            info(f"Capas encontradas: {len(por_capa)}")
+            sep()
+
+            for capa_e, ents_capa in sorted(por_capa.items()):
                 try:
-                    res=procesar(ent, mspace, doc)
-                    if res:
-                        n_ok+=1
-                        no,nd,ns,nl,na=res
-                        tot_o+=no; tot_dp+=nd; tot_s+=ns; tot_l+=nl; tot_a+=na
+                    if len(ents_capa) == 1:
+                        res = procesar(ents_capa[0], mspace, doc)
+                        if res:
+                            n_ok += 1
+                            no,nd,ns,nl,na = res
+                            tot_o+=no; tot_dp+=nd; tot_s+=ns; tot_l+=nl; tot_a+=na
+                        else:
+                            n_fail += 1
                     else:
-                        n_fail+=1
+                        # Multiples entidades en la misma capa — intentar unir
+                        resultados = procesar_grupo(ents_capa, mspace, doc)
+                        for res in resultados:
+                            if res:
+                                n_ok += 1
+                                no,nd,ns,nl,na = res
+                                tot_o+=no; tot_dp+=nd; tot_s+=ns; tot_l+=nl; tot_a+=na
+                        if not resultados:
+                            n_fail += len(ents_capa)
                 except Exception as e:
-                    err(f"[{ent.EntityName}]: {e}")
+                    err(f"Capa {capa_e}: {e}")
                     traceback.print_exc()
-                    n_fail+=1
+                    n_fail += len(ents_capa)
 
             try: doc.Regen(1)
             except: pass
