@@ -271,16 +271,26 @@ def es_recta(pts, tol):
 
 def intentar_arco(pts_z, tol):
     if len(pts_z)<3 or es_recta(pts_z,tol): return None
-    p0=pts_z[0]; pm=pts_z[len(pts_z)//2]; p1=pts_z[-1]
+    p0=pts_z[0]; p1=pts_z[-1]
 
     # Sagitta real: maxima desviacion de los puntos intermedios respecto a la cuerda p0-p1
-    # Si es muy pequeña, no vale la pena hacer un arco (seria una recta con ruido)
-    sagitta_real = max(dist_linea(pt, p0, p1) for pt in pts_z[1:-1]) if len(pts_z)>2 else 0
+    sagitta_real = 0; pm_idx = len(pts_z)//2
+    for idx in range(1, len(pts_z)-1):
+        d = dist_linea(pts_z[idx], p0, p1)
+        if d > sagitta_real:
+            sagitta_real = d; pm_idx = idx
+    pm = pts_z[pm_idx]
+
     MIN_SAGITTA_ABS   = tol * 4          # minimo 4x la tolerancia del arco en mm
     MIN_SAGITTA_RATIO = 0.008            # minimo 0.8% de la cuerda
     cuerda = dist2d(p0, p1)
     if sagitta_real < MIN_SAGITTA_ABS: return None
     if cuerda > 1.0 and sagitta_real / cuerda < MIN_SAGITTA_RATIO: return None
+
+    # Verificar que todos los puntos esten del mismo lado de la cuerda (no es curva en S)
+    lados = [math.copysign(1, (p1[0]-p0[0])*(pt[1]-p0[1]) - (p1[1]-p0[1])*(pt[0]-p0[0]))
+             for pt in pts_z[1:-1]]
+    if len(set(lados)) > 1: return None  # puntos en ambos lados = curva en S, no es arco
 
     circ=circulo_3pts(p0,pm,p1)
     if circ is None: return None
@@ -291,8 +301,8 @@ def intentar_arco(pts_z, tol):
 
     bulge=calcular_bulge(p0,pm,p1)
     if bulge is None: return None
-    # Rechazar arcos > 180° — crean loops en AutoCAD
-    if abs(bulge) > 1.0: return None
+    # Rechazar arcos >= 180° — crean loops en AutoCAD (bulge=1.0 es exactamente 180°, ok)
+    if abs(bulge) > 0.9999: return None
     return bulge
 
 def arc_fit(pts):
